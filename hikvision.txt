@@ -1,0 +1,133 @@
+package hikvision
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/rs/zerolog/log"
+)
+
+const (
+	SuccessCode               = 200
+	ErrorCodeInvalidRequest   = 400
+	ErrorCodeProcessingFailed = 500
+)
+
+// NewSuccessResponse creates a standard success response
+func NewSuccessResponse() Response {
+	return Response{
+		Status:  "success",
+		Code:    SuccessCode,
+		Message: "LPR data processed successfully",
+	}
+}
+
+// NewErrorResponse creates a standard error response
+func NewErrorResponse(code int, message string) ErrorResponse {
+	return ErrorResponse{
+		Error: message,
+		Code:  code,
+	}
+}
+
+// sendResponse handles all response formatting and sending
+func sendResponse(c *gin.Context, statusCode int, response interface{}) {
+	switch statusCode {
+	case http.StatusOK:
+		c.JSON(statusCode, response)
+	case http.StatusBadRequest, http.StatusInternalServerError:
+		c.JSON(statusCode, response)
+	default:
+		c.JSON(http.StatusInternalServerError, NewErrorResponse(
+			ErrorCodeProcessingFailed,
+			"Unknown processing error",
+		))
+	}
+}
+
+// Update the handler function to use proper responses
+func NewHandler(config HandlerConfig) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		startTime := time.Now()
+		clientIP := c.ClientIP()
+
+		// Check for multipart form
+		form, err := c.MultipartForm()
+		if err != nil {
+			log.Warn().Str("ip", clientIP).Msg("Invalid multipart form data")
+			sendResponse(c, http.StatusBadRequest, NewErrorResponse(
+				ErrorCodeInvalidRequest,
+				"multipart form data required",
+			))
+			return
+		}
+
+		// Process XML data
+		xmlFile, err := getFileFromForm(form, "anpr.xml")
+		if err != nil {
+			log.Warn().Str("ip", clientIP).Msg("anpr.xml file missing")
+			sendResponse(c, http.StatusBadRequest, NewErrorResponse(
+				ErrorCodeInvalidRequest,
+				"anpr.xml file required",
+			))
+			return
+		}
+
+		xmlData, err := readFileContent(xmlFile)
+		if err != nil {
+			log.Error().Str("ip", clientIP).Err(err).Msg("Failed to read XML file")
+			sendResponse(c, http.StatusInternalServerError, NewErrorResponse(
+				ErrorCodeProcessingFailed,
+				"failed to process request",
+			))
+			return
+		}
+
+		// Parse XML
+		alert, err := ParseXMLData(xmlData)
+		if err != nil {
+			log.Error().Str("ip", clientIP).Err(err).Msg("Failed to parse XML")
+			sendResponse(c, http.StatusBadRequest, NewErrorResponse(
+				ErrorCodeInvalidRequest,
+				"invalid XML format",
+			))
+			return
+		}
+
+		// Extract capture data
+		capture := ExtractCaptureFromAlert(alert)
+		capture.XMLData = xmlData
+
+		// Process images
+		images, err := ExtractImagesFromForm(form)
+		if err != nil {
+			log.Warn().Str("ip", clientIP).Err(err).Msg("Failed to extract images")
+		} else {
+			capture.Images = images
+		}
+
+		// Save data if configured
+		if config.SaveXML {
+			go saveXMLData(xmlData, capture.LicensePlate, clientIP)
+		}
+
+		if config.SaveImages && len(images) > 0 {
+			go saveImages(images, clientIP)
+		}
+
+		// Process the capture (business logic)
+		go ProcessCapture(capture)
+
+		// Log and respond
+		log.Info().
+			Str("ip", clientIP).
+			Str("licensePlate", capture.LicensePlate).
+			Str("direction", capture.Direction).
+			Int("confidence", capture.Confidence).
+			Dur("duration", time.Since(startTime)).
+			Msg("LPR event processed")
+
+		sendResponse(c, http.StatusOK, NewSuccessResponse())
+	}
+}
